@@ -27,6 +27,7 @@ import (
 	"testing"
 	"time"
 
+	"cloud.google.com/go/spanner/internal/backoff"
 	"cloud.google.com/go/spanner/internal/testutil"
 	sppb "google.golang.org/genproto/googleapis/spanner/v1"
 	"google.golang.org/grpc"
@@ -58,7 +59,7 @@ func TestSessionPoolConfigValidation(t *testing.T) {
 			errMinOpenedGTMaxOpened(5, 10),
 		},
 	} {
-		if _, err := newSessionPool("mockdb", test.spc, nil); !testEqual(err, test.err) {
+		if _, err := newSessionPool("mockdb", test.spc, nil, backoff.DefaultBackoff); !testEqual(err, test.err) {
 			t.Fatalf("want %v, got %v", test.err, err)
 		}
 	}
@@ -808,7 +809,7 @@ func TestStressSessionPool(t *testing.T) {
 		cfg.getRPCClient = func() (sppb.SpannerClient, error) {
 			return sc, nil
 		}
-		sp, _ := newSessionPool("mockdb", cfg, nil)
+		sp, _ := newSessionPool("mockdb", cfg, nil, backoff.DefaultBackoff)
 		defer sp.hc.close()
 		defer sp.close()
 
@@ -1011,7 +1012,7 @@ func TestMaintainer_CreatesSessions(t *testing.T) {
 		},
 	}
 	db := "mockdb"
-	sp, err := newSessionPool(db, spc, nil)
+	sp, err := newSessionPool(db, spc, nil, nil)
 	if err != nil {
 		t.Fatalf("cannot create session pool: %v", err)
 	}

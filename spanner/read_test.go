@@ -1075,7 +1075,7 @@ func TestRsdBlockingStates(t *testing.T) {
 			test.rpc,
 		)
 		// Override backoff to make the test run faster.
-		r.backoff = backoff.ExponentialBackoff{
+		r.backoff = &backoff.ExponentialBackoff{
 			Min: 1 * time.Nanosecond,
 			Max: 1 * time.Nanosecond,
 		}

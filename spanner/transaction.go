@@ -22,6 +22,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"cloud.google.com/go/spanner/internal/backoff"
 	"google.golang.org/api/iterator"
 	sppb "google.golang.org/genproto/googleapis/spanner/v1"
 	"google.golang.org/grpc"
@@ -301,6 +302,8 @@ type ReadOnlyTransaction struct {
 	rts time.Time
 	// tb is the read staleness bound specification for transactional reads.
 	tb TimestampBound
+	// backoff to compute delays between retries.
+	backoff *backoff.ExponentialBackoff
 }
 
 // errTxInitTimeout returns error for timeout in waiting for initialization of the transaction.
@@ -349,7 +352,7 @@ func (t *ReadOnlyTransaction) begin(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	err = runRetryable(contextWithOutgoingMetadata(ctx, sh.getMetadata()), func(ctx context.Context) error {
+	err = runRetryable(contextWithOutgoingMetadata(ctx, sh.getMetadata()), t.backoff, func(ctx context.Context) error {
 		res, e := sh.getClient().BeginTransaction(ctx, &sppb.BeginTransactionRequest{
 			Session: sh.getID(),
 			Options: &sppb.TransactionOptions{
@@ -633,6 +636,8 @@ type ReadWriteTransaction struct {
 	state txState
 	// wb is the set of buffered mutations waiting to be committed.
 	wb []*Mutation
+	// backoff to compute delays between retries.
+	backoff *backoff.ExponentialBackoff
 }
 
 // BufferWrite adds a list of mutations to the set of updates that will be
@@ -704,9 +709,9 @@ func (t *ReadWriteTransaction) release(err error) {
 	}
 }
 
-func beginTransaction(ctx context.Context, sid string, client sppb.SpannerClient) (transactionID, error) {
+func beginTransaction(ctx context.Context, sid string, client sppb.SpannerClient, b *backoff.ExponentialBackoff) (transactionID, error) {
 	var tx transactionID
-	err := runRetryable(ctx, func(ctx context.Context) error {
+	err := runRetryable(ctx, b, func(ctx context.Context) error {
 		res, e := client.BeginTransaction(ctx, &sppb.BeginTransactionRequest{
 			Session: sid,
 			Options: &sppb.TransactionOptions{
@@ -733,7 +738,7 @@ func (t *ReadWriteTransaction) begin(ctx context.Context) error {
 		t.state = txActive
 		return nil
 	}
-	tx, err := beginTransaction(contextWithOutgoingMetadata(ctx, t.sh.getMetadata()), t.sh.getID(), t.sh.getClient())
+	tx, err := beginTransaction(contextWithOutgoingMetadata(ctx, t.sh.getMetadata()), t.sh.getID(), t.sh.getClient(), t.backoff)
 	if err == nil {
 		t.tx = tx
 		t.state = txActive
@@ -760,7 +765,7 @@ func (t *ReadWriteTransaction) commit(ctx context.Context) (time.Time, error) {
 	if sid == "" || client == nil {
 		return ts, errSessionClosed(t.sh)
 	}
-	err = runRetryable(contextWithOutgoingMetadata(ctx, t.sh.getMetadata()), func(ctx context.Context) error {
+	err = runRetryable(contextWithOutgoingMetadata(ctx, t.sh.getMetadata()), t.backoff, func(ctx context.Context) error {
 		var trailer metadata.MD
 		res, e := client.Commit(ctx, &sppb.CommitRequest{
 			Session: sid,
@@ -794,7 +799,7 @@ func (t *ReadWriteTransaction) rollback(ctx context.Context) {
 	if sid == "" || client == nil {
 		return
 	}
-	err := runRetryable(contextWithOutgoingMetadata(ctx, t.sh.getMetadata()), func(ctx context.Context) error {
+	err := runRetryable(contextWithOutgoingMetadata(ctx, t.sh.getMetadata()), t.backoff, func(ctx context.Context) error {
 		_, e := client.Rollback(ctx, &sppb.RollbackRequest{
 			Session:       sid,
 			TransactionId: t.tx,
@@ -835,6 +840,8 @@ func (t *ReadWriteTransaction) runInTransaction(ctx context.Context, f func(cont
 type writeOnlyTransaction struct {
 	// sp is the session pool which writeOnlyTransaction uses to get Cloud Spanner sessions for blind writes.
 	sp *sessionPool
+	// backoff to compute delays between retries.
+	backoff *backoff.ExponentialBackoff
 }
 
 // applyAtLeastOnce commits a list of mutations to Cloud Spanner at least once, unless one of the following happens:
@@ -851,7 +858,7 @@ func (t *writeOnlyTransaction) applyAtLeastOnce(ctx context.Context, ms ...*Muta
 		// Malformed mutation found, just return the error.
 		return ts, err
 	}
-	err = runRetryable(ctx, func(ct context.Context) error {
+	err = runRetryable(ctx, t.backoff, func(ct context.Context) error {
 		var e error
 		var trailers metadata.MD
 		if sh == nil || sh.getID() == "" || sh.getClient() == nil {

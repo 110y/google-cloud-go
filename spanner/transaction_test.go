@@ -25,6 +25,7 @@ import (
 	"testing"
 	"time"
 
+	"cloud.google.com/go/spanner/internal/backoff"
 	"cloud.google.com/go/spanner/internal/testutil"
 	sppb "google.golang.org/genproto/googleapis/spanner/v1"
 	"google.golang.org/grpc"
@@ -327,13 +328,14 @@ func serverClientMock(t *testing.T, spc SessionPoolConfig) (_ *Client, _ *sessio
 		return &serverClientMock, nil
 	}
 	db := "mockdb"
-	sp, err := newSessionPool(db, spc, nil)
+	sp, err := newSessionPool(db, spc, nil, backoff.DefaultBackoff)
 	if err != nil {
 		t.Fatalf("cannot create session pool: %v", err)
 	}
 	client := Client{
 		database:     db,
 		idleSessions: sp,
+		backoff:      backoff.DefaultBackoff,
 	}
 	cleanup = func() {
 		client.Close()

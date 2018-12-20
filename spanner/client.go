@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"cloud.google.com/go/internal/version"
+	"cloud.google.com/go/spanner/internal/backoff"
 	"google.golang.org/api/option"
 	gtransport "google.golang.org/api/transport/grpc"
 	sppb "google.golang.org/genproto/googleapis/spanner/v1"
@@ -80,6 +81,8 @@ type Client struct {
 	idleSessions *sessionPool
 	// sessionLabels for the sessions created by this client.
 	sessionLabels map[string]string
+	// backoff to compute delays between retries.
+	backoff *backoff.ExponentialBackoff
 }
 
 // ClientConfig has configurations for the client.
@@ -92,6 +95,17 @@ type ClientConfig struct {
 	// SessionLabels for the sessions created by this client.
 	// See https://cloud.google.com/spanner/docs/reference/rpc/google.spanner.v1#session for more info.
 	SessionLabels map[string]string
+
+	// BackoffConfig is the configuration about the way to backing off.
+	BackoffConfig *BackoffConfig
+}
+
+// BackoffConfig has configurations about durations of backifng off.
+type BackoffConfig struct {
+	// MinBackoff is the minimum number of milliseconds that the client delays to back off failed operations exponentially.
+	MinBackoff int64
+	// MaxBackoff is the maximum number of milliseconds that the client delays to back off failed operations exponentially.
+	MaxBackoff int64
 }
 
 // errDial returns error for dialing to Cloud Spanner.
@@ -170,18 +184,29 @@ func NewClientWithConfig(ctx context.Context, database string, config ClientConf
 		c.conns = append(c.conns, conn)
 		c.clients = append(c.clients, sppb.NewSpannerClient(conn))
 	}
+
+	if config.BackoffConfig == nil {
+		c.backoff = backoff.DefaultBackoff
+	} else {
+		c.backoff = &backoff.ExponentialBackoff{
+			Min: time.Duration(config.BackoffConfig.MinBackoff) * time.Millisecond,
+			Max: time.Duration(config.BackoffConfig.MaxBackoff) * time.Millisecond,
+		}
+	}
+
 	// Prepare session pool.
 	config.SessionPoolConfig.getRPCClient = func() (sppb.SpannerClient, error) {
 		// TODO: support more loadbalancing options.
 		return c.rrNext(), nil
 	}
 	config.SessionPoolConfig.sessionLabels = c.sessionLabels
-	sp, err := newSessionPool(database, config.SessionPoolConfig, c.md)
+	sp, err := newSessionPool(database, config.SessionPoolConfig, c.md, c.backoff)
 	if err != nil {
 		c.Close()
 		return nil, err
 	}
 	c.idleSessions = sp
+
 	return c, nil
 }
 
@@ -210,7 +235,7 @@ func (c *Client) Close() {
 // "time-travel" to prior versions of the database, see the documentation of
 // TimestampBound for details.
 func (c *Client) Single() *ReadOnlyTransaction {
-	t := &ReadOnlyTransaction{singleUse: true, sp: c.idleSessions}
+	t := &ReadOnlyTransaction{singleUse: true, sp: c.idleSessions, backoff: c.backoff}
 	t.txReadOnly.txReadEnv = t
 	return t
 }
@@ -229,6 +254,7 @@ func (c *Client) ReadOnlyTransaction() *ReadOnlyTransaction {
 		singleUse:       false,
 		sp:              c.idleSessions,
 		txReadyOrClosed: make(chan struct{}),
+		backoff:         c.backoff,
 	}
 	t.txReadOnly.txReadEnv = t
 	return t
@@ -260,13 +286,13 @@ func (c *Client) BatchReadOnlyTransaction(ctx context.Context, tb TimestampBound
 	}()
 	// create session
 	sc := c.rrNext()
-	s, err = createSession(ctx, sc, c.database, c.sessionLabels, c.md)
+	s, err = createSession(ctx, sc, c.database, c.sessionLabels, c.md, c.backoff)
 	if err != nil {
 		return nil, err
 	}
 	sh = &sessionHandle{session: s}
 	// begin transaction
-	err = runRetryable(contextWithOutgoingMetadata(ctx, sh.getMetadata()), func(ctx context.Context) error {
+	err = runRetryable(contextWithOutgoingMetadata(ctx, sh.getMetadata()), c.backoff, func(ctx context.Context) error {
 		res, e := sh.getClient().BeginTransaction(ctx, &sppb.BeginTransactionRequest{
 			Session: sh.getID(),
 			Options: &sppb.TransactionOptions{
@@ -295,6 +321,7 @@ func (c *Client) BatchReadOnlyTransaction(ctx context.Context, tb TimestampBound
 			state:           txActive,
 			sh:              sh,
 			rts:             rts,
+			backoff:         c.backoff,
 		},
 		ID: BatchReadOnlyTransactionID{
 			tid: tx,
@@ -309,7 +336,7 @@ func (c *Client) BatchReadOnlyTransaction(ctx context.Context, tb TimestampBound
 // BatchReadOnlyTransactionFromID reconstruct a BatchReadOnlyTransaction from BatchReadOnlyTransactionID
 func (c *Client) BatchReadOnlyTransactionFromID(tid BatchReadOnlyTransactionID) *BatchReadOnlyTransaction {
 	sc := c.rrNext()
-	s := &session{valid: true, client: sc, id: tid.sid, createTime: time.Now(), md: c.md}
+	s := &session{valid: true, client: sc, id: tid.sid, createTime: time.Now(), md: c.md, backoff: c.backoff}
 	sh := &sessionHandle{session: s}
 
 	t := &BatchReadOnlyTransaction{
@@ -319,6 +346,7 @@ func (c *Client) BatchReadOnlyTransactionFromID(tid BatchReadOnlyTransactionID) 
 			state:           txActive,
 			sh:              sh,
 			rts:             tid.rts,
+			backoff:         c.backoff,
 		},
 		ID: tid,
 	}
@@ -363,7 +391,7 @@ func (c *Client) ReadWriteTransaction(ctx context.Context, f func(context.Contex
 		ts time.Time
 		sh *sessionHandle
 	)
-	err = runRetryableNoWrap(ctx, func(ctx context.Context) error {
+	err = runRetryableNoWrap(ctx, c.backoff, func(ctx context.Context) error {
 		var (
 			err error
 			t   *ReadWriteTransaction
@@ -376,12 +404,14 @@ func (c *Client) ReadWriteTransaction(ctx context.Context, f func(context.Contex
 				return err
 			}
 			t = &ReadWriteTransaction{
-				sh: sh,
-				tx: sh.getTransactionID(),
+				sh:      sh,
+				tx:      sh.getTransactionID(),
+				backoff: c.backoff,
 			}
 		} else {
 			t = &ReadWriteTransaction{
-				sh: sh,
+				sh:      sh,
+				backoff: c.backoff,
 			}
 		}
 		t.txReadOnly.txReadEnv = t
@@ -440,6 +470,9 @@ func (c *Client) Apply(ctx context.Context, ms []*Mutation, opts ...ApplyOption)
 
 	ctx = startSpan(ctx, "cloud.google.com/go/spanner.Apply")
 	defer func() { endSpan(ctx, err) }()
-	t := &writeOnlyTransaction{c.idleSessions}
+	t := &writeOnlyTransaction{
+		sp:      c.idleSessions,
+		backoff: c.backoff,
+	}
 	return t.applyAtLeastOnce(ctx, ms...)
 }

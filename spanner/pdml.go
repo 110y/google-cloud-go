@@ -45,14 +45,14 @@ func (c *Client) PartitionedUpdate(ctx context.Context, statement Statement) (co
 	)
 	// create session
 	sc := c.rrNext()
-	s, err = createSession(ctx, sc, c.database, c.sessionLabels, c.md)
+	s, err = createSession(ctx, sc, c.database, c.sessionLabels, c.md, c.backoff)
 	if err != nil {
 		return 0, toSpannerError(err)
 	}
 	defer s.delete(ctx)
 	sh = &sessionHandle{session: s}
 	// begin transaction
-	err = runRetryable(contextWithOutgoingMetadata(ctx, sh.getMetadata()), func(ctx context.Context) error {
+	err = runRetryable(contextWithOutgoingMetadata(ctx, sh.getMetadata()), c.backoff, func(ctx context.Context) error {
 		res, e := sc.BeginTransaction(ctx, &sppb.BeginTransactionRequest{
 			Session: sh.getID(),
 			Options: &sppb.TransactionOptions{

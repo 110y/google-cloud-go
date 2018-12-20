@@ -23,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	"cloud.google.com/go/spanner/internal/backoff"
 	"github.com/golang/protobuf/proto"
 	"github.com/golang/protobuf/ptypes"
 	edpb "google.golang.org/genproto/googleapis/rpc/errdetails"
@@ -44,7 +45,7 @@ func TestRetry(t *testing.T) {
 		status.Errorf(codes.Unavailable, "service is currently unavailable"),
 		errRetry(fmt.Errorf("just retry it")),
 	}
-	err := runRetryable(context.Background(), func(ct context.Context) error {
+	err := runRetryable(context.Background(), backoff.DefaultBackoff, func(ct context.Context) error {
 		var r error
 		if len(responses) > 0 {
 			r = responses[0]
@@ -57,7 +58,7 @@ func TestRetry(t *testing.T) {
 	}
 	// Unretryable errors
 	injErr := errors.New("this is unretryable")
-	err = runRetryable(context.Background(), func(ct context.Context) error {
+	err = runRetryable(context.Background(), backoff.DefaultBackoff, func(ct context.Context) error {
 		return injErr
 	})
 	if wantErr := toSpannerError(injErr); !testEqual(err, wantErr) {
@@ -67,7 +68,7 @@ func TestRetry(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	retryErr := errRetry(fmt.Errorf("still retrying"))
-	err = runRetryable(ctx, func(ct context.Context) error {
+	err = runRetryable(ctx, backoff.DefaultBackoff, func(ct context.Context) error {
 		// Expect to trigger timeout in retryable runner after 10 executions.
 		<-time.After(100 * time.Millisecond)
 		// Let retryable runner to retry so that timeout will eventually happen.
@@ -81,7 +82,7 @@ func TestRetry(t *testing.T) {
 	ctx, cancel = context.WithCancel(context.Background())
 	retries := 3
 	retryErr = errRetry(fmt.Errorf("retry before cancel"))
-	err = runRetryable(ctx, func(ct context.Context) error {
+	err = runRetryable(ctx, backoff.DefaultBackoff, func(ct context.Context) error {
 		retries--
 		if retries == 0 {
 			cancel()

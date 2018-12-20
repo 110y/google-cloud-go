@@ -32,7 +32,7 @@ const (
 	rate = 1.3
 )
 
-var DefaultBackoff = ExponentialBackoff{minBackoff, maxBackoff}
+var DefaultBackoff = &ExponentialBackoff{minBackoff, maxBackoff}
 
 type ExponentialBackoff struct {
 	Min, Max time.Duration

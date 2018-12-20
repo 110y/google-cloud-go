@@ -310,7 +310,7 @@ type resumableStreamDecoder struct {
 	// err is the last error resumableStreamDecoder has encountered so far.
 	err error
 	// backoff to compute delays between retries.
-	backoff backoff.ExponentialBackoff
+	backoff *backoff.ExponentialBackoff
 }
 
 // newResumableStreamDecoder creates a new resumeableStreamDecoder instance.

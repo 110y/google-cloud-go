@@ -218,7 +218,7 @@ func (t *BatchReadOnlyTransaction) Cleanup(ctx context.Context) {
 	}
 	t.sh = nil
 	sid, client := sh.getID(), sh.getClient()
-	err := runRetryable(ctx, func(ctx context.Context) error {
+	err := runRetryable(ctx, t.backoff, func(ctx context.Context) error {
 		_, e := client.DeleteSession(ctx, &sppb.DeleteSessionRequest{Name: sid})
 		return e
 	})

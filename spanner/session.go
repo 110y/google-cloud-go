@@ -27,6 +27,7 @@ import (
 	"sync"
 	"time"
 
+	"cloud.google.com/go/spanner/internal/backoff"
 	sppb "google.golang.org/genproto/googleapis/spanner/v1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -136,6 +137,8 @@ type session struct {
 	md metadata.MD
 	// tx contains the transaction id if the session has been prepared for write.
 	tx transactionID
+	// backoff to compute delays between retries.
+	backoff *backoff.ExponentialBackoff
 }
 
 // isValid returns true if the session is still valid for use.
@@ -164,7 +167,7 @@ func (s *session) String() string {
 func (s *session) ping() error {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	return runRetryable(ctx, func(ctx context.Context) error {
+	return runRetryable(ctx, s.backoff, func(ctx context.Context) error {
 		_, err := s.client.GetSession(contextWithOutgoingMetadata(ctx, s.pool.md), &sppb.GetSessionRequest{Name: s.getID()}) // s.getID is safe even when s is invalid.
 		return err
 	})
@@ -266,7 +269,7 @@ func (s *session) destroy(isExpire bool) bool {
 func (s *session) delete(ctx context.Context) {
 	// Ignore the error returned by runRetryable because even if we fail to explicitly destroy the session,
 	// it will be eventually garbage collected by Cloud Spanner.
-	err := runRetryable(ctx, func(ctx context.Context) error {
+	err := runRetryable(ctx, s.backoff, func(ctx context.Context) error {
 		_, e := s.client.DeleteSession(ctx, &sppb.DeleteSessionRequest{Name: s.getID()})
 		return e
 	})
@@ -280,7 +283,7 @@ func (s *session) prepareForWrite(ctx context.Context) error {
 	if s.isWritePrepared() {
 		return nil
 	}
-	tx, err := beginTransaction(ctx, s.getID(), s.client)
+	tx, err := beginTransaction(ctx, s.getID(), s.client, s.backoff)
 	if err != nil {
 		return err
 	}
@@ -367,10 +370,12 @@ type sessionPool struct {
 	md metadata.MD
 	// hc is the health checker
 	hc *healthChecker
+	// backoff to compute delays between retries.
+	backoff *backoff.ExponentialBackoff
 }
 
 // newSessionPool creates a new session pool.
-func newSessionPool(db string, config SessionPoolConfig, md metadata.MD) (*sessionPool, error) {
+func newSessionPool(db string, config SessionPoolConfig, md metadata.MD, b *backoff.ExponentialBackoff) (*sessionPool, error) {
 	if err := config.validate(); err != nil {
 		return nil, err
 	}
@@ -380,6 +385,7 @@ func newSessionPool(db string, config SessionPoolConfig, md metadata.MD) (*sessi
 		mayGetSession:     make(chan struct{}),
 		SessionPoolConfig: config,
 		md:                md,
+		backoff:           b,
 	}
 	if config.HealthCheckWorkers == 0 {
 		// With 10 workers and assuming average latency of 5 ms for BeginTransaction, we will be able to
@@ -469,7 +475,7 @@ func (p *sessionPool) createSession(ctx context.Context) (*session, error) {
 		doneCreate(false)
 		return nil, err
 	}
-	s, err := createSession(ctx, sc, p.db, p.sessionLabels, p.md)
+	s, err := createSession(ctx, sc, p.db, p.sessionLabels, p.md, p.backoff)
 	if err != nil {
 		doneCreate(false)
 		// Should return error directly because of the previous retries on CreateSession RPC.
@@ -481,9 +487,9 @@ func (p *sessionPool) createSession(ctx context.Context) (*session, error) {
 	return s, nil
 }
 
-func createSession(ctx context.Context, sc sppb.SpannerClient, db string, labels map[string]string, md metadata.MD) (*session, error) {
+func createSession(ctx context.Context, sc sppb.SpannerClient, db string, labels map[string]string, md metadata.MD, b *backoff.ExponentialBackoff) (*session, error) {
 	var s *session
-	err := runRetryable(ctx, func(ctx context.Context) error {
+	err := runRetryable(ctx, b, func(ctx context.Context) error {
 		sid, e := sc.CreateSession(ctx, &sppb.CreateSessionRequest{
 			Database: db,
 			Session:  &sppb.Session{Labels: labels},
@@ -492,7 +498,7 @@ func createSession(ctx context.Context, sc sppb.SpannerClient, db string, labels
 			return e
 		}
 		// If no error, construct the new session.
-		s = &session{valid: true, client: sc, id: sid.Name, createTime: time.Now(), md: md}
+		s = &session{valid: true, client: sc, id: sid.Name, createTime: time.Now(), md: md, backoff: b}
 		return nil
 	})
 	if err != nil {
